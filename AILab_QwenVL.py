@@ -36,6 +36,9 @@ from comfy.utils import ProgressBar
 
 # SageAttention support
 try:
+    # Try high-level API first (works with sageattention>=2.0)
+    from sageattention import sageattn as _sageattn_check  # noqa: F401
+    del _sageattn_check
     from sageattention.core import (
         sageattn_qk_int8_pv_fp16_cuda,
         sageattn_qk_int8_pv_fp8_cuda,
@@ -43,7 +46,20 @@ try:
     )
     SAGE_ATTENTION_AVAILABLE = True
 except ImportError:
-    SAGE_ATTENTION_AVAILABLE = False
+    try:
+        # Try direct core import (sageattention==1.0.6 compatible)
+        from sageattention.core import (
+            sageattn_qk_int8_pv_fp16_cuda,
+            sageattn_qk_int8_pv_fp8_cuda,
+        )
+        # v1.0.6 may not have sm90 variant
+        try:
+            from sageattention.core import sageattn_qk_int8_pv_fp8_cuda_sm90
+        except ImportError:
+            sageattn_qk_int8_pv_fp8_cuda_sm90 = sageattn_qk_int8_pv_fp8_cuda
+        SAGE_ATTENTION_AVAILABLE = True
+    except ImportError:
+        SAGE_ATTENTION_AVAILABLE = False
 
 NODE_DIR = Path(__file__).parent
 CONFIG_PATH = NODE_DIR / "hf_models.json"
@@ -297,7 +313,7 @@ def resolve_attention_mode(mode, force_sdpa=False):
     if mode == "sage":
         if sage_attn_available():
             return "sage"
-        print("[QwenVL] SageAttention forced but unavailable, falling back to SDPA")
+        # Silently fall back to SDPA when SageAttention is unavailable
         return "sdpa"
     if mode == "flash_attention_2":
         if flash_attn_available():
@@ -596,7 +612,7 @@ class QwenVLBase:
             elif is_bnb_quantization:
                 print("[QwenVL] BitsAndBytes quantization detected - forcing SDPA attention")
         
-        print(f"[QwenVL] Attention backend selected: {attn_impl}")
+        # Silently log attention backend (no noisy output)
         
         device_requested = self.device_info["recommended_device"] if device_choice == "auto" else device_choice
         device = normalize_device_choice(device_requested)
@@ -647,10 +663,21 @@ class QwenVLBase:
             load_kwargs["device_map"] = None
             load_kwargs["torch_dtype"] = "auto"  # Let transformers detect FP8 dtype from config
             
-            print(f"[QwenVL] Loading FP8 model to {target_device}...")
+            print(f"[QwenVL] Loading FP8 model...")
             
-            # Load model on CPU first (without device_map to avoid meta tensors)
-            self.model = AutoModelForVision2Seq.from_pretrained(model_path, **load_kwargs)
+            # Load model on CPU first (without device_map to avoid meta tensors), suppressing tqdm
+            import sys as _sys, os as _os
+            _fp8_suppress = open(_os.devnull, 'w')
+            _fp8_old_stderr = _sys.stderr
+            _fp8_old_stdout = _sys.stdout
+            _sys.stderr = _fp8_suppress
+            _sys.stdout = _fp8_suppress
+            try:
+                self.model = AutoModelForVision2Seq.from_pretrained(model_path, **load_kwargs)
+            finally:
+                _sys.stderr = _fp8_old_stderr
+                _sys.stdout = _fp8_old_stdout
+                _fp8_suppress.close()
             
             # Check if model has meta tensors and materialize them
             has_meta = any(param.device.type == "meta" for param in self.model.parameters())
@@ -721,13 +748,19 @@ class QwenVLBase:
             if quant_config:
                 load_kwargs["quantization_config"] = quant_config
             
-            # Show appropriate attention info in loading message
-            if attn_impl == "sage":
-                print(f"[QwenVL] Loading {model_name} ({quant.value}, base=sdpa, will_patch=sage)")
-            else:
-                print(f"[QwenVL] Loading {model_name} ({quant.value}, attn={actual_attn_impl})")
-            
-            self.model = AutoModelForVision2Seq.from_pretrained(model_path, **load_kwargs).eval()
+            # Load model silently, suppressing tqdm/progress bar output
+            import contextlib, io, os, sys
+            _suppress = open(os.devnull, 'w')
+            try:
+                _old_stderr = sys.stderr
+                _old_stdout = sys.stdout
+                sys.stderr = _suppress
+                sys.stdout = _suppress
+                self.model = AutoModelForVision2Seq.from_pretrained(model_path, **load_kwargs).eval()
+            finally:
+                sys.stderr = _old_stderr
+                sys.stdout = _old_stdout
+                _suppress.close()
         
         # Apply SageAttention patching if selected
         if attn_impl == "sage":
@@ -940,6 +973,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AILab_QwenVL": "QwenVL",
-    "AILab_QwenVL_Advanced": "QwenVL (Advanced)",
+    "AILab_QwenVL": "QwenVL A100",
+    "AILab_QwenVL_Advanced": "QwenVL Advanced A100",
 }

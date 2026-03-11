@@ -741,6 +741,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AILab_QwenVL_GGUF": "QwenVL (GGUF)",
-    "AILab_QwenVL_GGUF_Advanced": "QwenVL Advanced (GGUF)",
+    "AILab_QwenVL_GGUF": "QwenVL (GGUF) A100",
+    "AILab_QwenVL_GGUF_Advanced": "QwenVL Advanced (GGUF) A100",
 }
