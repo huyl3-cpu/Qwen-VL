@@ -669,7 +669,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
                 "temperature": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 2.0}),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0}),
                 "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0}),
-                "frame_count": ("INT", {"default": 16, "min": 1, "max": 64}),
+                "frame_count": ("INT", {"default": 16, "min": 1, "max": 256}),
                 "ctx": ("INT", {"default": 8192, "min": 1024, "max": 262144, "step": 512}),
                 "n_batch": ("INT", {"default": 512, "min": 64, "max": 32768, "step": 64}),
                 "gpu_layers": ("INT", {"default": -1, "min": -1, "max": 200}),
