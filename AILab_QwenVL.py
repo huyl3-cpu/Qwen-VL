@@ -47,19 +47,31 @@ try:
     SAGE_ATTENTION_AVAILABLE = True
 except ImportError:
     try:
-        # Try direct core import (sageattention==1.0.6 compatible)
-        from sageattention.core import (
+        # Try custom sageattn3 installation
+        from sageattn3 import sageattn as _sageattn_check  # noqa: F401
+        del _sageattn_check
+        from sageattn3.core import (
             sageattn_qk_int8_pv_fp16_cuda,
             sageattn_qk_int8_pv_fp8_cuda,
+            sageattn_qk_int8_pv_fp8_cuda_sm90,
         )
-        # v1.0.6 may not have sm90 variant
-        try:
-            from sageattention.core import sageattn_qk_int8_pv_fp8_cuda_sm90
-        except ImportError:
-            sageattn_qk_int8_pv_fp8_cuda_sm90 = sageattn_qk_int8_pv_fp8_cuda
         SAGE_ATTENTION_AVAILABLE = True
     except ImportError:
-        SAGE_ATTENTION_AVAILABLE = False
+        try:
+            # Try direct core import (sageattention==1.0.6 compatible)
+            from sageattention.core import (
+                sageattn_qk_int8_pv_fp16_cuda,
+                sageattn_qk_int8_pv_fp8_cuda,
+            )
+            # v1.0.6 may not have sm90 variant
+            try:
+                from sageattention.core import sageattn_qk_int8_pv_fp8_cuda_sm90
+            except ImportError:
+                sageattn_qk_int8_pv_fp8_cuda_sm90 = sageattn_qk_int8_pv_fp8_cuda
+            SAGE_ATTENTION_AVAILABLE = True
+        except ImportError:
+            SAGE_ATTENTION_AVAILABLE = False
+
 
 NODE_DIR = Path(__file__).parent
 CONFIG_PATH = NODE_DIR / "hf_models.json"
@@ -104,7 +116,7 @@ class Quantization(str, Enum):
                 return item
         raise ValueError(f"Unsupported quantization: {value}")
 
-ATTENTION_MODES = ["auto", "sage", "flash_attention_2", "sdpa"]
+ATTENTION_MODES = ["auto", "sageattn3", "sage", "flash_attention_2", "sdpa"]
 
 def load_model_configs():
     global HF_VL_MODELS, HF_TEXT_MODELS, HF_ALL_MODELS, SYSTEM_PROMPTS, PRESET_PROMPTS
@@ -310,6 +322,10 @@ def resolve_attention_mode(mode, force_sdpa=False):
     
     if mode == "sdpa":
         return "sdpa"
+    if mode == "sageattn3":
+        if sage_attn_available():
+            return "sageattn3"
+        return "sdpa"
     if mode == "sage":
         if sage_attn_available():
             return "sage"
@@ -321,10 +337,10 @@ def resolve_attention_mode(mode, force_sdpa=False):
         print("[QwenVL] Flash-Attn forced but unavailable, falling back to SDPA")
         return "sdpa"
     
-    # Auto mode: try sage → flash → sdpa
+    # Auto mode: try sageattn3 → flash → sdpa
     if sage_attn_available():
-        print("[QwenVL] Auto mode: Using SageAttention")
-        return "sage"
+        print("[QwenVL] Auto mode: Using SageAttention/SageAttn3")
+        return "sageattn3"
     if flash_attn_available():
         print("[QwenVL] Auto mode: Using Flash Attention 2")
         return "flash_attention_2"
@@ -632,7 +648,7 @@ class QwenVLBase:
         # Handle attention mode for loading
         # SageAttention requires loading with SDPA first, then patching
         actual_attn_impl = attn_impl
-        if attn_impl == "sage":
+        if attn_impl in ["sage", "sageattn3"]:
             actual_attn_impl = "sdpa"
         
         # Build load kwargs
@@ -763,7 +779,7 @@ class QwenVLBase:
                 _suppress.close()
         
         # Apply SageAttention patching if selected
-        if attn_impl == "sage":
+        if attn_impl in ["sage", "sageattn3"]:
             try:
                 set_sage_attention(self.model)
                 print("[QwenVL] SageAttention enabled")
