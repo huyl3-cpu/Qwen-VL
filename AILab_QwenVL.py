@@ -840,6 +840,7 @@ class QwenVLBase:
         conversation = [{"role": "user", "content": []}]
         if image is not None:
             conversation[0]["content"].append({"type": "image", "image": self.tensor_to_pil(image)})
+        frames = []
         if video is not None:
             frames = [self.tensor_to_pil(frame) for frame in video]
             if len(frames) > frame_count:
@@ -872,12 +873,18 @@ class QwenVLBase:
             kwargs.update({"do_sample": True, "temperature": temperature, "top_p": top_p})
         else:
             kwargs["do_sample"] = False
-        outputs = self.model.generate(**model_inputs, **kwargs)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        input_len = model_inputs["input_ids"].shape[-1]
-        text = self.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
-        return text.strip()
+        try:
+            outputs = self.model.generate(**model_inputs, **kwargs)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            input_len = model_inputs["input_ids"].shape[-1]
+            text = self.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
+            return text.strip()
+        finally:
+            # Fix memory leak: free GPU tensors and PIL frames after inference
+            del model_inputs, outputs
+            frames.clear()
+            gc.collect()
 
     def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device):
         # Create progress bar with 3 stages: setup, model loading, generation
@@ -918,6 +925,8 @@ class QwenVLBase:
             
             return (text,)
         finally:
+            # Fix memory leak: always run gc after inference
+            gc.collect()
             if not keep_model_loaded:
                 self.clear()
 

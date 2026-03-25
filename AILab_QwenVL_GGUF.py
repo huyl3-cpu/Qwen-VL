@@ -189,8 +189,11 @@ def _tensor_to_base64_png(tensor) -> str | None:
     array = (tensor * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
     pil_img = Image.fromarray(array, mode="RGB")
     buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+    try:
+        pil_img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    finally:
+        buf.close()  # Fix memory leak: always close BytesIO buffer
 
 
 def _sample_video_frames(video, frame_count: int):
@@ -587,6 +590,9 @@ class QwenVLGGUFBase:
             )
             return (text,)
         finally:
+            # Fix memory leak: always free base64 image buffers after inference
+            images_b64.clear()
+            gc.collect()
             if not keep_model_loaded:
                 self.clear()
 
