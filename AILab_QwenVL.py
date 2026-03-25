@@ -854,11 +854,21 @@ class QwenVLBase:
         video_frames = [frame for item in conversation[0]["content"] if item["type"] == "video" for frame in item["video"]]
         videos = [video_frames] if video_frames else None
         processed = self.processor(text=chat, images=images or None, videos=videos, return_tensors="pt")
+
+        # Free PIL objects and conversation immediately after processor encoding
+        frames.clear()
+        images.clear()
+        video_frames.clear()
+        conversation.clear()
+
         model_device = next(self.model.parameters()).device
         model_inputs = {
             key: value.to(model_device) if torch.is_tensor(value) else value
             for key, value in processed.items()
         }
+        # Free CPU-side processor output (pixel_values etc.) immediately
+        del processed
+
         stop_tokens = [self.tokenizer.eos_token_id]
         if hasattr(self.tokenizer, "eot_id") and self.tokenizer.eot_id is not None:
             stop_tokens.append(self.tokenizer.eot_id)
@@ -873,6 +883,7 @@ class QwenVLBase:
             kwargs.update({"do_sample": True, "temperature": temperature, "top_p": top_p})
         else:
             kwargs["do_sample"] = False
+        outputs = None
         try:
             outputs = self.model.generate(**model_inputs, **kwargs)
             if torch.cuda.is_available():
@@ -881,10 +892,15 @@ class QwenVLBase:
             text = self.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
             return text.strip()
         finally:
-            # Fix memory leak: free GPU tensors and PIL frames after inference
-            del model_inputs, outputs
-            frames.clear()
+            # Free GPU tensors
+            del model_inputs
+            if outputs is not None:
+                del outputs
+            # Clear HuggingFace KV cache (past_key_values stored in model)
+            if hasattr(self.model, "_cache"):
+                self.model._cache = None
             gc.collect()
+
 
     def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, clear_ram, attention_mode, use_torch_compile, device):
         # Create progress bar with 3 stages: setup, model loading, generation
