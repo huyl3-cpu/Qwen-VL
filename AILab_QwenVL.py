@@ -822,7 +822,9 @@ class QwenVLBase:
         if tensor.dim() == 4:
             tensor = tensor[0]
         array = (tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-        return Image.fromarray(array)
+        pil = Image.fromarray(array)
+        del array  # release numpy copy immediately
+        return pil
 
     @torch.no_grad()
     def generate(
@@ -883,6 +885,8 @@ class QwenVLBase:
             kwargs.update({"do_sample": True, "temperature": temperature, "top_p": top_p})
         else:
             kwargs["do_sample"] = False
+        # Disable KV cache during generation to prevent RAM accumulation across runs
+        kwargs["use_cache"] = False
         outputs = None
         try:
             outputs = self.model.generate(**model_inputs, **kwargs)
