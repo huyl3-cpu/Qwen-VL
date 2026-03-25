@@ -537,6 +537,7 @@ class QwenVLGGUFBase:
         repetition_penalty: float,
         seed: int,
         keep_model_loaded: bool,
+        clear_ram: bool,
         device: str,
         ctx: int | None,
         n_batch: int | None,
@@ -592,7 +593,10 @@ class QwenVLGGUFBase:
         finally:
             # Fix memory leak: always free base64 image buffers after inference
             images_b64.clear()
-            gc.collect()
+            if clear_ram:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             if not keep_model_loaded:
                 self.clear()
 
@@ -615,6 +619,7 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
                 "custom_prompt": ("STRING", {"default": "", "multiline": True}),
                 "max_tokens": ("INT", {"default": 512, "min": 64, "max": 2048}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
+                "clear_ram": ("BOOLEAN", {"default": False, "tooltip": "Clear RAM/VRAM after inference to free memory"}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
             },
             "optional": {
@@ -635,6 +640,7 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
         custom_prompt,
         max_tokens,
         keep_model_loaded,
+        clear_ram,
         seed,
         image=None,
         video=None,
@@ -652,6 +658,7 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
             repetition_penalty=1.2,
             seed=seed,
             keep_model_loaded=keep_model_loaded,
+            clear_ram=clear_ram,
             device="auto",
             ctx=None,
             n_batch=None,
@@ -695,6 +702,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
                 "top_k": ("INT", {"default": 0, "min": 0, "max": 32768}),
                 "pool_size": ("INT", {"default": 4194304, "min": 1048576, "max": 10485760, "step": 524288}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
+                "clear_ram": ("BOOLEAN", {"default": False, "tooltip": "Clear RAM/VRAM after inference to free memory"}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
             },
             "optional": {
@@ -726,6 +734,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
         top_k,
         pool_size,
         keep_model_loaded,
+        clear_ram,
         seed,
         image=None,
         video=None,
@@ -743,6 +752,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
             repetition_penalty=repetition_penalty,
             seed=seed,
             keep_model_loaded=keep_model_loaded,
+            clear_ram=clear_ram,
             device=device,
             ctx=ctx,
             n_batch=n_batch,
