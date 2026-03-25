@@ -301,16 +301,23 @@ def _resolve_model_entry(model_name: str) -> GGUFVLResolved:
     )
 
 
+GLOBAL_QWENVL_GGUF_STATE = {
+    "llm": None,
+    "chat_handler": None,
+    "signature": None
+}
+
 class QwenVLGGUFBase:
     def __init__(self):
         self.llm = None
         self.chat_handler = None
-        self.current_signature = None
 
     def clear(self):
         self.llm = None
         self.chat_handler = None
-        self.current_signature = None
+        GLOBAL_QWENVL_GGUF_STATE["llm"] = None
+        GLOBAL_QWENVL_GGUF_STATE["chat_handler"] = None
+        GLOBAL_QWENVL_GGUF_STATE["signature"] = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -387,7 +394,9 @@ class QwenVLGGUFBase:
             top_k_val,
             pool_size_val,
         )
-        if self.llm is not None and self.current_signature == signature:
+        if GLOBAL_QWENVL_GGUF_STATE["llm"] is not None and GLOBAL_QWENVL_GGUF_STATE["signature"] == signature:
+            self.llm = GLOBAL_QWENVL_GGUF_STATE["llm"]
+            self.chat_handler = GLOBAL_QWENVL_GGUF_STATE["chat_handler"]
             return
 
         self.clear()
@@ -450,7 +459,10 @@ class QwenVLGGUFBase:
         if device_kind == "cuda" and n_gpu_layers == 0:
             print("[QwenVL] Warning: device=cuda selected but n_gpu_layers=0; model will run on CPU.")
         self.llm = Llama(**llm_kwargs_filtered)
-        self.current_signature = signature
+        
+        GLOBAL_QWENVL_GGUF_STATE["llm"] = self.llm
+        GLOBAL_QWENVL_GGUF_STATE["chat_handler"] = self.chat_handler
+        GLOBAL_QWENVL_GGUF_STATE["signature"] = signature
 
     def _invoke(
         self,

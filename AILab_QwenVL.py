@@ -568,27 +568,36 @@ def quantization_config(model_name, quantization):
         return BitsAndBytesConfig(load_in_8bit=True), None, False
     return None, torch.float16 if torch.cuda.is_available() else torch.float32, False
 
+GLOBAL_QWENVL_STATE = {
+    "model": None,
+    "processor": None,
+    "tokenizer": None,
+    "signature": None
+}
+
 class QwenVLBase:
     def __init__(self):
         self.device_info = get_device_info()
         self.model = None
         self.processor = None
         self.tokenizer = None
-        self.current_signature = None
         print(f"[QwenVL] Node on {self.device_info['device_type']}")
 
     def clear(self):
         """Clear model from memory and free VRAM."""
-        if self.model is not None:
+        if GLOBAL_QWENVL_STATE["model"] is not None:
             # Move model to CPU first to free GPU memory
             try:
-                self.model = self.model.cpu()
+                GLOBAL_QWENVL_STATE["model"] = GLOBAL_QWENVL_STATE["model"].cpu()
             except:
                 pass
-            self.model = None
+            GLOBAL_QWENVL_STATE["model"] = None
+        self.model = None
         self.processor = None
         self.tokenizer = None
-        self.current_signature = None
+        GLOBAL_QWENVL_STATE["processor"] = None
+        GLOBAL_QWENVL_STATE["tokenizer"] = None
+        GLOBAL_QWENVL_STATE["signature"] = None
         
         # Force garbage collection
         gc.collect()
@@ -635,7 +644,10 @@ class QwenVLBase:
         signature = (model_name, quant.value, attn_impl, device, use_compile)
         
         # Check if we need to reload (model, quantization, or attention changed)
-        if keep_model_loaded and self.model is not None and self.current_signature == signature:
+        if keep_model_loaded and GLOBAL_QWENVL_STATE["model"] is not None and GLOBAL_QWENVL_STATE["signature"] == signature:
+            self.model = GLOBAL_QWENVL_STATE["model"]
+            self.processor = GLOBAL_QWENVL_STATE["processor"]
+            self.tokenizer = GLOBAL_QWENVL_STATE["tokenizer"]
             return
         
         # Clear model and VRAM before loading new configuration
@@ -797,7 +809,11 @@ class QwenVLBase:
                 print(f"[QwenVL] torch.compile skipped: {exc}")
         self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        self.current_signature = signature
+        
+        GLOBAL_QWENVL_STATE["model"] = self.model
+        GLOBAL_QWENVL_STATE["processor"] = self.processor
+        GLOBAL_QWENVL_STATE["tokenizer"] = self.tokenizer
+        GLOBAL_QWENVL_STATE["signature"] = signature
 
     @staticmethod
     def tensor_to_pil(tensor):
