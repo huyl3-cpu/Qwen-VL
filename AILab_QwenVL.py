@@ -47,30 +47,31 @@ try:
     SAGE_ATTENTION_AVAILABLE = True
 except ImportError:
     try:
-        # Try custom sageattn3 installation
-        from sageattn3 import sageattn as _sageattn_check  # noqa: F401
-        del _sageattn_check
-        from sageattn3.core import (
+        # Try direct core import (sageattention==1.0.6 compatible)
+        from sageattention.core import (
             sageattn_qk_int8_pv_fp16_cuda,
             sageattn_qk_int8_pv_fp8_cuda,
-            sageattn_qk_int8_pv_fp8_cuda_sm90,
         )
+        # v1.0.6 may not have sm90 variant
+        try:
+            from sageattention.core import sageattn_qk_int8_pv_fp8_cuda_sm90
+        except ImportError:
+            sageattn_qk_int8_pv_fp8_cuda_sm90 = sageattn_qk_int8_pv_fp8_cuda
         SAGE_ATTENTION_AVAILABLE = True
     except ImportError:
-        try:
-            # Try direct core import (sageattention==1.0.6 compatible)
-            from sageattention.core import (
-                sageattn_qk_int8_pv_fp16_cuda,
-                sageattn_qk_int8_pv_fp8_cuda,
-            )
-            # v1.0.6 may not have sm90 variant
-            try:
-                from sageattention.core import sageattn_qk_int8_pv_fp8_cuda_sm90
-            except ImportError:
-                sageattn_qk_int8_pv_fp8_cuda_sm90 = sageattn_qk_int8_pv_fp8_cuda
-            SAGE_ATTENTION_AVAILABLE = True
-        except ImportError:
-            SAGE_ATTENTION_AVAILABLE = False
+        SAGE_ATTENTION_AVAILABLE = False
+
+# ── sageattn3 FP4 Blackwell (sageattn3_blackwell) ────────────────────
+SAGE_ATTN3_FUNC = None
+try:
+    from sageattn3 import sageattn3_blackwell as _sa3_import
+    SAGE_ATTN3_FUNC = _sa3_import
+    del _sa3_import
+    if torch.cuda.is_available():
+        _s3_major, _s3_minor = torch.cuda.get_device_capability()
+        print(f"[QwenVL] sageattn3_blackwell available — SM{_s3_major*10+_s3_minor}")
+except (ImportError, AttributeError) as _e:
+    pass  # sageattn3 not installed or wrong version
 
 
 NODE_DIR = Path(__file__).parent
@@ -117,6 +118,10 @@ class Quantization(str, Enum):
         raise ValueError(f"Unsupported quantization: {value}")
 
 ATTENTION_MODES = ["auto", "sageattn3", "sage", "flash_attention_2", "sdpa"]
+
+def sage3_available():
+    """True if sageattn3_blackwell FP4 kernel is available (Blackwell SM120+)."""
+    return SAGE_ATTN3_FUNC is not None
 
 def load_model_configs():
     global HF_VL_MODELS, HF_TEXT_MODELS, HF_ALL_MODELS, SYSTEM_PROMPTS, PRESET_PROMPTS
@@ -323,8 +328,10 @@ def resolve_attention_mode(mode, force_sdpa=False):
     if mode == "sdpa":
         return "sdpa"
     if mode == "sageattn3":
+        if sage3_available():
+            return "sageattn3"   # real FP4 Blackwell kernel
         if sage_attn_available():
-            return "sageattn3"
+            return "sage"        # FP8 fallback
         return "sdpa"
     if mode == "sage":
         if sage_attn_available():
@@ -337,14 +344,17 @@ def resolve_attention_mode(mode, force_sdpa=False):
         print("[QwenVL] Flash-Attn forced but unavailable, falling back to SDPA")
         return "sdpa"
     
-    # Auto mode: try sageattn3 → flash → sdpa
+    # Auto mode: sageattn3 FP4 → sage FP8 → flash → sdpa
+    if sage3_available():
+        print("[QwenVL] Auto mode: sageattn3_blackwell FP4 (Blackwell)")
+        return "sageattn3"
     if sage_attn_available():
-        print("[QwenVL] Auto mode: Using SageAttention/SageAttn3")
+        print("[QwenVL] Auto mode: SageAttention FP8")
         return "sageattn3"
     if flash_attn_available():
-        print("[QwenVL] Auto mode: Using Flash Attention 2")
+        print("[QwenVL] Auto mode: Flash Attention 2")
         return "flash_attention_2"
-    print("[QwenVL] Auto mode: Using SDPA")
+    print("[QwenVL] Auto mode: SDPA")
     return "sdpa"
 
 
@@ -479,9 +489,125 @@ def set_sage_attention(model):
                 patched_count += 1
 
     if patched_count > 0:
-        print(f"[QwenVL] SageAttention: Patched {patched_count} attention layers")
+        print(f"[QwenVL] SageAttention FP8: Patched {patched_count} attention layers")
     else:
         print("[QwenVL] SageAttention: No compatible attention layers found to patch")
+
+
+def set_sageattn3_attention(model):
+    """
+    Apply sageattn3_blackwell (FP4 native on Blackwell SM120+) to Qwen attention layers.
+    API: sageattn3_blackwell(q, k, v, attn_mask=None, is_causal=False)
+    head_dim must be power-of-2. Falls back to SDPA for non-pow2 head_dim.
+    """
+    if not sage3_available():
+        raise ImportError("sageattn3 not installed. pip install sageattn3")
+
+    def _is_pow2(n):
+        return n > 0 and (n & (n - 1)) == 0
+
+    attention_classes = []
+    try:
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, apply_rotary_pos_emb as qwen2_apply_rotary
+        attention_classes.append((Qwen2Attention, qwen2_apply_rotary))
+    except ImportError:
+        pass
+    try:
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention, apply_rotary_pos_emb as qwen3_apply_rotary
+        attention_classes.append((Qwen3Attention, qwen3_apply_rotary))
+    except ImportError:
+        pass
+    try:
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextAttention, apply_rotary_pos_emb as qwen3vl_apply_rotary
+        attention_classes.append((Qwen3VLTextAttention, qwen3vl_apply_rotary))
+    except ImportError:
+        pass
+    if not attention_classes:
+        print("[QwenVL] sageattn3: No compatible attention classes found")
+        return
+
+    def make_sa3_forward(AttentionClass, apply_rotary_pos_emb_func):
+        def sa3_forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: tuple = None,
+            attention_mask: torch.Tensor = None,
+            past_key_values=None,
+            cache_position: torch.LongTensor = None,
+            position_ids: torch.LongTensor = None,
+            **kwargs,
+        ):
+            original_dtype = hidden_states.dtype
+            is_4bit = hasattr(self.q_proj, 'quant_state')
+            target_dtype = torch.bfloat16 if is_4bit else self.q_proj.weight.dtype
+            if hidden_states.dtype != target_dtype:
+                hidden_states = hidden_states.to(target_dtype)
+
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, self.head_dim)
+            bsz = input_shape[0]
+            q_len = input_shape[1] if len(input_shape) > 1 else hidden_states.size(1)
+
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+
+            if hasattr(self, 'q_norm'):
+                query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+            else:
+                query_states = query_states.view(hidden_shape).transpose(1, 2)
+            if hasattr(self, 'k_norm'):
+                key_states = self.k_norm(key_states.view(hidden_shape)).transpose(1, 2)
+            else:
+                key_states = key_states.view(hidden_shape).transpose(1, 2)
+            value_states = value_states.view(hidden_shape).transpose(1, 2)
+
+            if position_embeddings is not None:
+                cos, sin = position_embeddings
+                query_states, key_states = apply_rotary_pos_emb_func(query_states, key_states, cos, sin)
+
+            if past_key_values is not None:
+                cache_kwargs = {"sin": sin if position_embeddings else None,
+                                "cos": cos if position_embeddings else None,
+                                "cache_position": cache_position}
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+            is_causal = attention_mask is None and q_len > 1
+
+            # sageattn3_blackwell requires power-of-2 head_dim
+            if _is_pow2(self.head_dim):
+                attn_output = SAGE_ATTN3_FUNC(
+                    query_states.to(target_dtype),
+                    key_states.to(target_dtype),
+                    value_states.to(target_dtype),
+                    attn_mask=attention_mask,
+                    is_causal=is_causal,
+                )
+            else:
+                # Fallback to SDPA for non-power-of-2 head_dim
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states, key_states, value_states,
+                    attn_mask=attention_mask, is_causal=is_causal
+                )
+
+            if isinstance(attn_output, tuple):
+                attn_output = attn_output[0]
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(*input_shape, -1)
+            attn_output = self.o_proj(attn_output)
+            if attn_output.dtype != original_dtype:
+                attn_output = attn_output.to(original_dtype)
+            return attn_output, None
+        return sa3_forward
+
+    patched = 0
+    for AttentionClass, apply_rotary_func in attention_classes:
+        sa3_fwd = make_sa3_forward(AttentionClass, apply_rotary_func)
+        for module in model.modules():
+            if isinstance(module, AttentionClass):
+                module.forward = sa3_fwd.__get__(module, AttentionClass)
+                patched += 1
+    print(f"[QwenVL] sageattn3_blackwell FP4: Patched {patched} attention layers")
 
 def ensure_model(model_name):
     info = HF_ALL_MODELS.get(model_name)
@@ -842,11 +968,21 @@ class QwenVLBase:
                 sys.stdout = _old_stdout
                 _suppress.close()
         
-        # Apply SageAttention patching if selected
-        if attn_impl in ["sage", "sageattn3"]:
+        # Apply attention patching if selected
+        if attn_impl == "sageattn3" and sage3_available():
+            try:
+                set_sageattn3_attention(self.model)
+                print("[QwenVL] sageattn3_blackwell FP4 enabled")
+            except Exception as exc:
+                print(f"[QwenVL] sageattn3_blackwell failed: {exc}, falling back to FP8")
+                try:
+                    set_sage_attention(self.model)
+                except Exception as exc2:
+                    print(f"[QwenVL] SageAttention also failed: {exc2}")
+        elif attn_impl in ["sage", "sageattn3"]:
             try:
                 set_sage_attention(self.model)
-                print("[QwenVL] SageAttention enabled")
+                print("[QwenVL] SageAttention FP8 enabled")
             except Exception as exc:
                 print(f"[QwenVL] SageAttention patching failed: {exc}")
         
