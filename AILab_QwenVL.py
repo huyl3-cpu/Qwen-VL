@@ -576,7 +576,6 @@ GLOBAL_QWENVL_STATE = {
 }
 
 # ── Auto RAM-clear (RAM-based) ───────────────────────────────────────────────
-RAM_AUTO_CLEAR_THRESHOLD = 60.0   # % system RAM — deep-clear triggers above this
 
 
 def deep_clear_ram(label: str = ""):
@@ -652,15 +651,15 @@ def _get_ram_percent() -> float:
     return psutil.virtual_memory().percent
 
 
-def _check_and_auto_clear() -> bool:
+def _check_and_auto_clear(threshold: float) -> bool:
     """
     Measure RAM right after each inference.
-    If system RAM >= RAM_AUTO_CLEAR_THRESHOLD → deep-clear and return True.
+    If system RAM >= threshold % → deep-clear and return True.
     Otherwise do nothing and return False.
     """
     ram_pct = _get_ram_percent()
-    if ram_pct >= RAM_AUTO_CLEAR_THRESHOLD:
-        print(f"[QwenVL] Auto-clear: RAM {ram_pct:.1f}% >= {RAM_AUTO_CLEAR_THRESHOLD:.0f}% threshold")
+    if ram_pct >= threshold:
+        print(f"[QwenVL] Auto-clear: RAM {ram_pct:.1f}% >= {threshold:.0f}% threshold")
         deep_clear_ram(f"(auto: RAM {ram_pct:.1f}%)")
         return True
     return False
@@ -996,7 +995,7 @@ class QwenVLBase:
             gc.collect()
 
 
-    def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, clear_ram, attention_mode, use_torch_compile, device):
+    def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, clear_ram, ram_threshold, attention_mode, use_torch_compile, device):
         # Create progress bar with 3 stages: setup, model loading, generation
         pbar = ProgressBar(3)
         
@@ -1041,8 +1040,8 @@ class QwenVLBase:
                 print("[QwenVL] Clearing RAM (manual)…")
                 deep_clear_ram("(manual)")
             else:
-                # Auto: measure RAM now, deep-clear only if > 60%
-                if not _check_and_auto_clear():
+                # Auto: measure RAM now, deep-clear only if > ram_threshold%
+                if not _check_and_auto_clear(float(ram_threshold)):
                     gc.collect()   # light GC when RAM is fine
 
             if not keep_model_loaded:
@@ -1065,7 +1064,8 @@ class AILab_QwenVL(QwenVLBase):
                 "custom_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": TOOLTIPS["custom_prompt"]}),
                 "max_tokens": ("INT", {"default": 512, "min": 64, "max": 2048, "tooltip": TOOLTIPS["max_tokens"]}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
-                "clear_ram": ("BOOLEAN", {"default": False, "tooltip": "Force clear RAM/VRAM after every response. Auto-clear also triggers automatically when system RAM > 60%."}),
+                "clear_ram": ("BOOLEAN", {"default": False, "tooltip": "Force clear RAM/VRAM after every response. Auto-clear also triggers when RAM exceeds ram_threshold %."}),
+                "ram_threshold": ("FLOAT", {"default": 60.0, "min": 10.0, "max": 95.0, "step": 1.0, "tooltip": "System RAM percentage threshold for auto-clear."}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"]}),
             },
             "optional": {
@@ -1079,8 +1079,8 @@ class AILab_QwenVL(QwenVLBase):
     FUNCTION = "process"
     CATEGORY = "🧪AILab/QwenVL"
 
-    def process(self, model_name, quantization, preset_prompt, custom_prompt, attention_mode, max_tokens, keep_model_loaded, clear_ram, seed, image=None, video=None):
-        return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, 16, max_tokens, 0.6, 0.9, 1, 1.2, seed, keep_model_loaded, clear_ram, attention_mode, False, "auto")
+    def process(self, model_name, quantization, preset_prompt, custom_prompt, attention_mode, max_tokens, keep_model_loaded, clear_ram, ram_threshold, seed, image=None, video=None):
+        return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, 16, max_tokens, 0.6, 0.9, 1, 1.2, seed, keep_model_loaded, clear_ram, ram_threshold, attention_mode, False, "auto")
 
 class AILab_QwenVL_Advanced(QwenVLBase):
     @classmethod
@@ -1111,7 +1111,8 @@ class AILab_QwenVL_Advanced(QwenVLBase):
                 "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0, "tooltip": TOOLTIPS["repetition_penalty"]}),
                 "frame_count": ("INT", {"default": 16, "min": 1, "max": 256, "tooltip": TOOLTIPS["frame_count"]}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
-                "clear_ram": ("BOOLEAN", {"default": False, "tooltip": "Force clear RAM/VRAM after every response. Auto-clear also triggers automatically when system RAM > 60%."}),
+                "clear_ram": ("BOOLEAN", {"default": False, "tooltip": "Force clear RAM/VRAM after every response. Auto-clear also triggers when RAM exceeds ram_threshold %."}),
+                "ram_threshold": ("FLOAT", {"default": 60.0, "min": 10.0, "max": 95.0, "step": 1.0, "tooltip": "System RAM percentage threshold for auto-clear."}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"]}),
             },
             "optional": {
@@ -1125,8 +1126,8 @@ class AILab_QwenVL_Advanced(QwenVLBase):
     FUNCTION = "process"
     CATEGORY = "🧪AILab/QwenVL"
 
-    def process(self, model_name, quantization, attention_mode, use_torch_compile, device, preset_prompt, custom_prompt, max_tokens, temperature, top_p, num_beams, repetition_penalty, frame_count, keep_model_loaded, clear_ram, seed, image=None, video=None):
-        return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, clear_ram, attention_mode, use_torch_compile, device)
+    def process(self, model_name, quantization, attention_mode, use_torch_compile, device, preset_prompt, custom_prompt, max_tokens, temperature, top_p, num_beams, repetition_penalty, frame_count, keep_model_loaded, clear_ram, ram_threshold, seed, image=None, video=None):
+        return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, clear_ram, ram_threshold, attention_mode, use_torch_compile, device)
 
 NODE_CLASS_MAPPINGS = {
     "AILab_QwenVL": AILab_QwenVL,
