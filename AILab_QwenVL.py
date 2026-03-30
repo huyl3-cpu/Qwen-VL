@@ -698,7 +698,8 @@ GLOBAL_QWENVL_STATE = {
     "model": None,
     "processor": None,
     "tokenizer": None,
-    "signature": None
+    "signature": None,
+    "_proc_signature": None,   # separate cache key for processor/tokenizer
 }
 
 
@@ -762,28 +763,32 @@ class QwenVLBase:
         print(f"[QwenVL] Node on {self.device_info['device_type']}")
 
     def clear(self):
-        """Clear model from memory and free VRAM."""
-        if GLOBAL_QWENVL_STATE["model"] is not None:
-            # Move model to CPU first to free GPU memory
-            try:
-                GLOBAL_QWENVL_STATE["model"] = GLOBAL_QWENVL_STATE["model"].cpu()
-            except:
-                pass
+        """Clear MODEL from VRAM. Processor/tokenizer are kept cached (CPU only)."""
+        model = GLOBAL_QWENVL_STATE.get("model")
+        if model is not None:
+            # Nullify self.model FIRST so refcount drops before .cpu()
+            self.model = None
             GLOBAL_QWENVL_STATE["model"] = None
-        self.model = None
-        self.processor = None
-        self.tokenizer = None
-        GLOBAL_QWENVL_STATE["processor"] = None
-        GLOBAL_QWENVL_STATE["tokenizer"] = None
-        GLOBAL_QWENVL_STATE["signature"] = None
-        
-        # Force garbage collection
-        gc.collect()
-        
-        # Clear CUDA cache
+            try:
+                model.cpu()   # release VRAM explicitly
+            except Exception:
+                pass
+            del model
+        else:
+            self.model = None
+        # DO NOT clear processor/tokenizer here:
+        # They live in CPU RAM only, HF rebuilds internal caches on every from_pretrained()
+        # which causes systematic RAM growth. Keep them alive between runs.
+        GLOBAL_QWENVL_STATE["signature"] = None   # force model reload next run
+        # (keep _proc_signature so processor/tokenizer are reused)
+
+        # Force GPU cleanup
+        for _ in range(3):
+            gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
     def load_model(
         self,
@@ -999,8 +1004,20 @@ class QwenVLBase:
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         
         GLOBAL_QWENVL_STATE["model"] = self.model
-        GLOBAL_QWENVL_STATE["processor"] = self.processor
-        GLOBAL_QWENVL_STATE["tokenizer"] = self.tokenizer
+        # Only reload processor/tokenizer if model_name changed
+        _proc_sig = model_name
+        if GLOBAL_QWENVL_STATE.get("_proc_signature") != _proc_sig or \
+                GLOBAL_QWENVL_STATE.get("processor") is None:
+            self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            GLOBAL_QWENVL_STATE["processor"] = self.processor
+            GLOBAL_QWENVL_STATE["tokenizer"] = self.tokenizer
+            GLOBAL_QWENVL_STATE["_proc_signature"] = _proc_sig
+            print(f"[QwenVL] Processor/tokenizer loaded and cached for '{model_name}'")
+        else:
+            self.processor = GLOBAL_QWENVL_STATE["processor"]
+            self.tokenizer = GLOBAL_QWENVL_STATE["tokenizer"]
+            print(f"[QwenVL] Processor/tokenizer reused from cache (no HF requests)")
         GLOBAL_QWENVL_STATE["signature"] = signature
 
     @staticmethod
