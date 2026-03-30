@@ -581,34 +581,40 @@ def clear_memory_cache():
     Properly clear GPU VRAM cache and CPU RAM after each inference.
     Does NOT unload the model - safe inside for-loops and queue jobs.
     """
-    # 1. Wipe HuggingFace KV-cache on the loaded model
+    # 1. Wipe HuggingFace KV-cache variants on the loaded model
     model = GLOBAL_QWENVL_STATE.get("model")
     if model is not None:
-        if hasattr(model, "_cache"):
-            model._cache = None
-        if hasattr(model, "past_key_values"):
-            model.past_key_values = None
-        if hasattr(model, "generation_config") and hasattr(model.generation_config, "_past_key_values"):
-            model.generation_config._past_key_values = None
+        for _attr in ("_cache", "past_key_values", "_past",
+                      "cache_position", "_encoder_outputs"):
+            if hasattr(model, _attr):
+                setattr(model, _attr, None)
+        if hasattr(model, "generation_config"):
+            cfg = model.generation_config
+            for _attr in ("_past_key_values", "past_key_values"):
+                if hasattr(cfg, _attr):
+                    setattr(cfg, _attr, None)
 
     # 2. Multi-pass Python GC (catches cyclic refs)
-    for _ in range(3):
+    for _ in range(4):
         gc.collect()
 
-    # 3. Clear GPU VRAM cache
+    # 3. Clear GPU VRAM cache — both fragmentation and IPC buffers
     if torch.cuda.is_available():
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()      # free inter-process CUDA buffers
         try:
             torch.cuda.reset_peak_memory_stats()
+            torch.cuda.reset_accumulated_memory_stats()
         except Exception:
             pass
-        torch.cuda.synchronize()
 
     # 4. Return OS pages (Linux / Colab)
     try:
         if platform.system() == "Linux":
             import ctypes
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)   # return fragmented pages to OS
     except Exception:
         pass
 
@@ -942,14 +948,27 @@ class QwenVLBase:
             text = self.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
             return text.strip()
         finally:
-            # Free GPU tensors
+            # Force-free individual GPU tensors (not just dict reference)
+            for _k in list(model_inputs.keys()):
+                _v = model_inputs[_k]
+                if torch.is_tensor(_v):
+                    del _v
             del model_inputs
             if outputs is not None:
                 del outputs
-            # Clear HuggingFace KV cache (past_key_values stored in model)
+            # Clear HuggingFace internal model caches
             if hasattr(self.model, "_cache"):
                 self.model._cache = None
-            gc.collect()
+            if hasattr(self.model, "cache_position"):
+                self.model.cache_position = None
+            if hasattr(self.model, "_past"):
+                self.model._past = None
+            # Multi-pass GC + CUDA
+            for _ in range(2):
+                gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
 
 
     def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, clear_ram, attention_mode, use_torch_compile, device):
