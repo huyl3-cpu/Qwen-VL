@@ -765,30 +765,30 @@ class QwenVLBase:
     def clear(self):
         """Clear MODEL from VRAM. Processor/tokenizer are kept cached (CPU only)."""
         model = GLOBAL_QWENVL_STATE.get("model")
+        # Nullify ALL references first so refcount drops to 0 immediately
+        self.model = None
+        GLOBAL_QWENVL_STATE["model"] = None
+        GLOBAL_QWENVL_STATE["signature"] = None  # force model reload next run
         if model is not None:
-            # Nullify self.model FIRST so refcount drops before .cpu()
-            self.model = None
-            GLOBAL_QWENVL_STATE["model"] = None
-            try:
-                model.cpu()   # release VRAM explicitly
-            except Exception:
-                pass
-            del model
-        else:
-            self.model = None
-        # DO NOT clear processor/tokenizer here:
-        # They live in CPU RAM only, HF rebuilds internal caches on every from_pretrained()
-        # which causes systematic RAM growth. Keep them alive between runs.
-        GLOBAL_QWENVL_STATE["signature"] = None   # force model reload next run
-        # (keep _proc_signature so processor/tokenizer are reused)
+            del model  # refcount → 0 → GPU tensors freed by CUDA allocator
+        # DO NOT call model.cpu() — it creates an 8GB CPU spike that
+        # glibc holds even after free() unless malloc_trim() is called.
+        # Just del + empty_cache() is sufficient for GPU memory.
 
-        # Force GPU cleanup
-        for _ in range(3):
+        for _ in range(4):
             gc.collect()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+        # Return OS pages after freeing model weights
+        try:
+            import platform as _plat
+            if _plat.system() == "Linux":
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 
     def load_model(
         self,
@@ -1101,11 +1101,9 @@ class QwenVLBase:
             text = self.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
             return text.strip()
         finally:
-            # Force-free individual GPU tensors (not just dict reference)
             for _k in list(model_inputs.keys()):
-                _v = model_inputs[_k]
-                if torch.is_tensor(_v):
-                    del _v
+                if torch.is_tensor(model_inputs.get(_k)):
+                    del model_inputs[_k]   # remove from dict to drop refcount
             del model_inputs
             if outputs is not None:
                 del outputs
@@ -1147,6 +1145,13 @@ class QwenVLBase:
         pbar.update_absolute(2, 3, None)
         
         try:
+            _psutil = __import__("psutil")
+            _ram_before = _psutil.virtual_memory().percent
+            _vram_before = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+        except Exception:
+            _ram_before = _vram_before = 0
+
+        try:
             text = self.generate(
                 prompt,
                 image,
@@ -1158,11 +1163,14 @@ class QwenVLBase:
                 num_beams,
                 repetition_penalty,
             )
-            
+
             pbar.update_absolute(3, 3, None)
-            
+
             return (text,)
         finally:
+            # Release ComfyUI input tensor refs held by this invocation
+            del image, video
+
             if clear_ram:
                 print("[QwenVL] clear_ram=True — clearing VRAM cache + CPU RAM…")
                 clear_memory_cache()
@@ -1170,6 +1178,18 @@ class QwenVLBase:
                 gc.collect()  # always do light GC
             if not keep_model_loaded:
                 self.clear()
+
+            # Memory delta log — helps diagnose where growth occurs
+            try:
+                _psutil = __import__("psutil")
+                _ram_after = _psutil.virtual_memory().percent
+                _vram_after = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+                _delta_ram = _ram_after - _ram_before
+                _sign = "+" if _delta_ram >= 0 else ""
+                print(f"[QwenVL] Δ RAM {_sign}{_delta_ram:.1f}% ({_ram_before:.1f}%→{_ram_after:.1f}%)"
+                      f" | VRAM {_vram_before:.2f}→{_vram_after:.2f} GB")
+            except Exception:
+                pass
 
 class AILab_QwenVL(QwenVLBase):
     @classmethod
