@@ -575,94 +575,51 @@ GLOBAL_QWENVL_STATE = {
     "signature": None
 }
 
-# ── Auto RAM-clear (RAM-based) ───────────────────────────────────────────────
 
-
-def deep_clear_ram(label: str = ""):
+def clear_memory_cache():
     """
-    Aggressive RAM / VRAM cleanup that does NOT unload the loaded model.
-    Safe to call inside a for-loop because GLOBAL_QWENVL_STATE["model"] is
-    left intact – only intermediate / cached tensors are freed.
+    Properly clear GPU VRAM cache and CPU RAM after each inference.
+    Does NOT unload the model - safe inside for-loops and queue jobs.
     """
-    tag = f"[QwenVL]{(' ' + label) if label else ''}"
-
-    # 1. Clear HuggingFace KV-cache stored on the model object
+    # 1. Wipe HuggingFace KV-cache on the loaded model
     model = GLOBAL_QWENVL_STATE.get("model")
     if model is not None:
-        # past_key_values / cache objects
         if hasattr(model, "_cache"):
             model._cache = None
         if hasattr(model, "past_key_values"):
             model.past_key_values = None
-        # DynamicCache / StaticCache stored in generation_config
-        if hasattr(model, "generation_config"):
-            cfg = model.generation_config
-            if hasattr(cfg, "_past_key_values"):
-                cfg._past_key_values = None
-        # Flush any internal HF Accelerate device maps if present
-        if hasattr(model, "hf_device_map"):
-            try:
-                from accelerate.utils import send_to_device  # noqa: F401
-                # no-op: just ensure the attribute exists and is valid
-            except ImportError:
-                pass
+        if hasattr(model, "generation_config") and hasattr(model.generation_config, "_past_key_values"):
+            model.generation_config._past_key_values = None
 
-    # 2. Multi-pass Python garbage collection
+    # 2. Multi-pass Python GC (catches cyclic refs)
     for _ in range(3):
         gc.collect()
 
-    # 3. CUDA cache + memory defragmentation
+    # 3. Clear GPU VRAM cache
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        # Trim the allocator's block pool (PyTorch >= 2.1)
-        try:
-            torch.cuda.memory.empty_cache()
-        except Exception:
-            pass
-        # Release memory held by allocator fragmentation
         try:
             torch.cuda.reset_peak_memory_stats()
         except Exception:
             pass
         torch.cuda.synchronize()
 
-    # 4. Force Python to release OS pages via ctypes (Linux / Colab)
+    # 4. Return OS pages (Linux / Colab)
     try:
-        import ctypes, platform
         if platform.system() == "Linux":
-            libc = ctypes.CDLL("libc.so.6")
-            libc.malloc_trim(0)
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
 
-    # Log current RAM state after cleanup
-    vm = psutil.virtual_memory()
-    ram_pct = vm.percent
-    gpu_info = ""
+    # Log result
+    vm = __import__("psutil").virtual_memory()
+    msg = f"[QwenVL] clear_ram done → CPU {vm.percent:.1f}%"
     if torch.cuda.is_available():
-        alloc_gb = torch.cuda.memory_allocated() / 1024**3
-        total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        gpu_info = f" | GPU {alloc_gb:.1f}/{total_gb:.1f} GB"
-    print(f"{tag} RAM cleared → sys RAM {ram_pct:.1f}%{gpu_info}")
-
-
-def _get_ram_percent() -> float:
-    """Return current system RAM usage as a percentage (0-100)."""
-    return psutil.virtual_memory().percent
-
-
-def _check_and_auto_clear(threshold: float) -> bool:
-    """
-    Measure RAM right after each inference.
-    If system RAM >= threshold % → deep-clear and return True.
-    Otherwise do nothing and return False.
-    """
-    ram_pct = _get_ram_percent()
-    if ram_pct >= threshold:
-        print(f"[QwenVL] Auto-clear: RAM {ram_pct:.1f}% >= {threshold:.0f}% threshold")
-        deep_clear_ram(f"(auto: RAM {ram_pct:.1f}%)")
-        return True
-    return False
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        msg += f" | VRAM alloc {alloc:.2f}/{total:.1f} GB"
+    print(msg)
 
 class QwenVLBase:
     def __init__(self):
@@ -995,7 +952,7 @@ class QwenVLBase:
             gc.collect()
 
 
-    def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, clear_ram, ram_threshold, attention_mode, use_torch_compile, device):
+    def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, clear_ram, attention_mode, use_torch_compile, device):
         # Create progress bar with 3 stages: setup, model loading, generation
         pbar = ProgressBar(3)
         
@@ -1034,16 +991,11 @@ class QwenVLBase:
             
             return (text,)
         finally:
-            # ── RAM management after each inference ────────────────────────
             if clear_ram:
-                # Manual force-clear
-                print("[QwenVL] Clearing RAM (manual)…")
-                deep_clear_ram("(manual)")
+                print("[QwenVL] clear_ram=True — clearing VRAM cache + CPU RAM…")
+                clear_memory_cache()
             else:
-                # Auto: measure RAM now, deep-clear only if > ram_threshold%
-                if not _check_and_auto_clear(float(ram_threshold)):
-                    gc.collect()   # light GC when RAM is fine
-
+                gc.collect()  # always do light GC
             if not keep_model_loaded:
                 self.clear()
 
@@ -1064,8 +1016,7 @@ class AILab_QwenVL(QwenVLBase):
                 "custom_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": TOOLTIPS["custom_prompt"]}),
                 "max_tokens": ("INT", {"default": 512, "min": 64, "max": 2048, "tooltip": TOOLTIPS["max_tokens"]}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
-                "clear_ram": ("BOOLEAN", {"default": False, "tooltip": "Force clear RAM/VRAM after every response. Auto-clear also triggers when RAM exceeds ram_threshold %."}),
-                "ram_threshold": ("FLOAT", {"default": 60.0, "min": 10.0, "max": 95.0, "step": 1.0, "tooltip": "System RAM percentage threshold for auto-clear."}),
+                "clear_ram": ("BOOLEAN", {"default": False, "tooltip": "Clear RAM/VRAM after inference to free memory"}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"]}),
             },
             "optional": {
@@ -1079,8 +1030,8 @@ class AILab_QwenVL(QwenVLBase):
     FUNCTION = "process"
     CATEGORY = "🧪AILab/QwenVL"
 
-    def process(self, model_name, quantization, preset_prompt, custom_prompt, attention_mode, max_tokens, keep_model_loaded, clear_ram, ram_threshold, seed, image=None, video=None):
-        return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, 16, max_tokens, 0.6, 0.9, 1, 1.2, seed, keep_model_loaded, clear_ram, ram_threshold, attention_mode, False, "auto")
+    def process(self, model_name, quantization, preset_prompt, custom_prompt, attention_mode, max_tokens, keep_model_loaded, clear_ram, seed, image=None, video=None):
+        return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, 16, max_tokens, 0.6, 0.9, 1, 1.2, seed, keep_model_loaded, clear_ram, attention_mode, False, "auto")
 
 class AILab_QwenVL_Advanced(QwenVLBase):
     @classmethod
@@ -1111,8 +1062,7 @@ class AILab_QwenVL_Advanced(QwenVLBase):
                 "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0, "tooltip": TOOLTIPS["repetition_penalty"]}),
                 "frame_count": ("INT", {"default": 16, "min": 1, "max": 256, "tooltip": TOOLTIPS["frame_count"]}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
-                "clear_ram": ("BOOLEAN", {"default": False, "tooltip": "Force clear RAM/VRAM after every response. Auto-clear also triggers when RAM exceeds ram_threshold %."}),
-                "ram_threshold": ("FLOAT", {"default": 60.0, "min": 10.0, "max": 95.0, "step": 1.0, "tooltip": "System RAM percentage threshold for auto-clear."}),
+                "clear_ram": ("BOOLEAN", {"default": False, "tooltip": "Clear RAM/VRAM after inference to free memory"}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"]}),
             },
             "optional": {
@@ -1126,8 +1076,8 @@ class AILab_QwenVL_Advanced(QwenVLBase):
     FUNCTION = "process"
     CATEGORY = "🧪AILab/QwenVL"
 
-    def process(self, model_name, quantization, attention_mode, use_torch_compile, device, preset_prompt, custom_prompt, max_tokens, temperature, top_p, num_beams, repetition_penalty, frame_count, keep_model_loaded, clear_ram, ram_threshold, seed, image=None, video=None):
-        return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, clear_ram, ram_threshold, attention_mode, use_torch_compile, device)
+    def process(self, model_name, quantization, attention_mode, use_torch_compile, device, preset_prompt, custom_prompt, max_tokens, temperature, top_p, num_beams, repetition_penalty, frame_count, keep_model_loaded, clear_ram, seed, image=None, video=None):
+        return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, clear_ram, attention_mode, use_torch_compile, device)
 
 NODE_CLASS_MAPPINGS = {
     "AILab_QwenVL": AILab_QwenVL,
