@@ -1309,9 +1309,12 @@ class AILab_FreeMemory:
             from server import PromptServer
             executor = PromptServer.instance.prompt_executor
             if hasattr(executor, "outputs") and isinstance(executor.outputs, dict):
-                # Keep only the last prompt's outputs (most recent = still needed)
+                # Keep last 3 prompt caches as buffer — forLoopEnd may reference
+                # the previous iteration's output for value accumulation.
+                # Clearing only older entries beyond this buffer is safe.
+                KEEP_LAST = 3
                 prompt_ids = list(executor.outputs.keys())
-                for old_id in prompt_ids[:-1]:   # clear all except the latest
+                for old_id in prompt_ids[:-KEEP_LAST]:
                     del executor.outputs[old_id]
                     cleared_prompts += 1
                 if cleared_prompts > 0:
@@ -1319,7 +1322,7 @@ class AILab_FreeMemory:
             # Also clear outputs_ui (UI preview data cache)
             if hasattr(executor, "outputs_ui") and isinstance(executor.outputs_ui, dict):
                 ui_ids = list(executor.outputs_ui.keys())
-                for old_id in ui_ids[:-1]:
+                for old_id in ui_ids[:-KEEP_LAST]:
                     del executor.outputs_ui[old_id]
         except Exception as e:
             print(f"[FreeMemory] Could not clear executor cache: {e}")
