@@ -703,12 +703,36 @@ GLOBAL_QWENVL_STATE = {
 }
 
 
+def _deep_clear_output_cache():
+    """Recursively clear output tensor data from ComfyUI's nested subcache tree.
+    Frees video frame tensors accumulated by for-loop subgraph expansion.
+    Does NOT touch subcaches structure to avoid executor assertion errors.
+    """
+    try:
+        from server import PromptServer
+        cache = PromptServer.instance.prompt_executor.caches.outputs
+        def _clear(c):
+            cleared = 0
+            if hasattr(c, 'cache') and isinstance(c.cache, dict):
+                cleared += len(c.cache)
+                c.cache.clear()
+            if hasattr(c, 'subcaches') and isinstance(c.subcaches, dict):
+                for sc in c.subcaches.values():
+                    cleared += _clear(sc)
+            return cleared
+        n = _clear(cache)
+        if n > 0:
+            print(f"[QwenVL] Subcache deep-cleared {n} entries (video tensors freed)")
+    except Exception as e:
+        print(f"[QwenVL] Subcache clear skipped: {e}")
+
+
 def clear_memory_cache():
     """
-    Properly clear GPU VRAM cache and CPU RAM after each inference.
-    Does NOT unload the model - safe inside for-loops and queue jobs.
+    Clear GPU VRAM cache, CPU RAM and ComfyUI output subcache after each inference.
+    Called when clear_ram=True. Does NOT unload the model.
     """
-    # 1. Wipe HuggingFace KV-cache variants on the loaded model
+    # 1. Wipe HuggingFace KV-cache on loaded model
     model = GLOBAL_QWENVL_STATE.get("model")
     if model is not None:
         for _attr in ("_cache", "past_key_values", "_past",
@@ -721,27 +745,34 @@ def clear_memory_cache():
                 if hasattr(cfg, _attr):
                     setattr(cfg, _attr, None)
 
-    # 2. Multi-pass Python GC (catches cyclic refs)
-    for _ in range(4):
+    # 2. Deep-clear ComfyUI output subcache tree (video frame tensors)
+    _deep_clear_output_cache()
+
+    # 3. Multi-pass Python GC
+    for _ in range(3):
         gc.collect()
 
-    # 3. Clear GPU VRAM cache — both fragmentation and IPC buffers
+    # 4. Clear GPU VRAM cache
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()      # free inter-process CUDA buffers
+        torch.cuda.ipc_collect()
         try:
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.reset_accumulated_memory_stats()
         except Exception:
             pass
 
-    # 4. Return OS pages (Linux / Colab)
+    # 5. Return OS pages
     try:
         if platform.system() == "Linux":
             import ctypes
-            libc = ctypes.CDLL("libc.so.6")
-            libc.malloc_trim(0)   # return fragmented pages to OS
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        elif platform.system() == "Windows":
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            k32.SetProcessWorkingSetSizeEx(
+                k32.GetCurrentProcess(), ctypes.c_size_t(-1), ctypes.c_size_t(-1), 0)
     except Exception:
         pass
 
@@ -1172,12 +1203,13 @@ class QwenVLBase:
             del image, video
 
             if clear_ram:
-                print("[QwenVL] clear_ram=True — clearing VRAM cache + CPU RAM…")
-                clear_memory_cache()
+                print("[QwenVL] clear_ram=True — unloading model + clearing all caches…")
+                self.clear()          # unload model from VRAM + RAM
+                clear_memory_cache()  # deep-clear subcache + CUDA + GC
             else:
-                gc.collect()  # always do light GC
-            if not keep_model_loaded:
-                self.clear()
+                gc.collect()  # light GC only
+            if not keep_model_loaded and not clear_ram:
+                self.clear()          # unload if keep_model_loaded=False
 
             # Memory delta log — helps diagnose where growth occurs
             try:
