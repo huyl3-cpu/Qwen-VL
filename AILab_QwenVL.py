@@ -1299,7 +1299,32 @@ class AILab_FreeMemory:
         # Drop local refs immediately so GC can collect upstream tensors
         del image, video
 
-        # Aggressive GC — frees cyclic refs holding large tensors
+        # ── KEY FIX: Clear ComfyUI executor output cache ──────────────────────
+        # easy forLoopStart/End requeues each iteration as a NEW prompt_id.
+        # ComfyUI stores executor.outputs[prompt_id] for EVERY past iteration,
+        # accumulating ALL video tensors (e.g. 122 × 735MB = ~90GB).
+        # We clear old prompt outputs, keeping only the most recent one.
+        cleared_prompts = 0
+        try:
+            from server import PromptServer
+            executor = PromptServer.instance.prompt_executor
+            if hasattr(executor, "outputs") and isinstance(executor.outputs, dict):
+                # Keep only the last prompt's outputs (most recent = still needed)
+                prompt_ids = list(executor.outputs.keys())
+                for old_id in prompt_ids[:-1]:   # clear all except the latest
+                    del executor.outputs[old_id]
+                    cleared_prompts += 1
+                if cleared_prompts > 0:
+                    print(f"[FreeMemory] Cleared {cleared_prompts} old prompt caches from executor")
+            # Also clear outputs_ui (UI preview data cache)
+            if hasattr(executor, "outputs_ui") and isinstance(executor.outputs_ui, dict):
+                ui_ids = list(executor.outputs_ui.keys())
+                for old_id in ui_ids[:-1]:
+                    del executor.outputs_ui[old_id]
+        except Exception as e:
+            print(f"[FreeMemory] Could not clear executor cache: {e}")
+
+        # Aggressive GC — frees cyclic refs after executor cache clear
         for _ in range(4):
             gc.collect()
 
@@ -1319,7 +1344,7 @@ class AILab_FreeMemory:
 
         try:
             vm = __import__("psutil").virtual_memory()
-            print(f"[FreeMemory] RAM after GC: {vm.percent:.1f}% used ({vm.available / 1024**3:.1f} GB free)")
+            print(f"[FreeMemory] RAM: {vm.percent:.1f}% used ({vm.available / 1024**3:.1f} GB free)")
         except Exception:
             pass
 
