@@ -1296,11 +1296,40 @@ class AILab_FreeMemory:
     OUTPUT_NODE = True
 
     def free(self, passthrough, image=None, video=None):
-        # Drop local refs immediately so GC can collect upstream tensors
+        # Drop local refs immediately
         del image, video
 
-        # Aggressive GC — frees cyclic refs first
-        for _ in range(4):
+        # ── CORE FIX: Deep-clear nested subcache output data ─────────────────
+        # Root cause: for-loop subgraph expansion builds a NESTED subcache tree:
+        #   Top → S1[video1 tensor] → S2[video2 tensor] → S3[video3] ...
+        # Each S_n.clean_unused() only cleans S_n, NEVER its parent S_{n-1}.
+        # After N iterations: S1...S_N all still holding their tensors → OOM.
+        #
+        # Fix: recursively clear cache.cache (tensor data) at every level.
+        # We do NOT touch cache.subcaches (structure) to avoid assertion errors
+        # when executor tries to store results in the next iteration.
+        try:
+            from server import PromptServer
+            executor = PromptServer.instance.prompt_executor
+            outputs_cache = executor.caches.outputs
+
+            def _deep_clear_data(cache):
+                cleared = 0
+                if hasattr(cache, 'cache') and isinstance(cache.cache, dict):
+                    cleared += len(cache.cache)
+                    cache.cache.clear()  # free tensor refs
+                if hasattr(cache, 'subcaches') and isinstance(cache.subcaches, dict):
+                    for sc in cache.subcaches.values():
+                        cleared += _deep_clear_data(sc)
+                return cleared
+
+            total = _deep_clear_data(outputs_cache)
+            print(f"[FreeMemory] Deep-cleared {total} output cache entries")
+        except Exception as e:
+            print(f"[FreeMemory] Cache clear error: {e}")
+
+        # GC — frees cyclic refs after cache clear
+        for _ in range(3):
             gc.collect()
 
         # CUDA allocator flush
@@ -1309,28 +1338,21 @@ class AILab_FreeMemory:
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
-        # ── Return OS physical pages ─────────────────────────────────────────
-        # Root cause on Windows: Python frees tensor → C heap freed → but Windows
-        # keeps pages in process Working Set. psutil shows high RAM%.
-        # SetProcessWorkingSetSizeEx forces Windows to trim the working set.
+        # OS working set trim
         try:
             if platform.system() == "Windows":
                 import ctypes
-                import ctypes.wintypes
-                kernel32 = ctypes.windll.kernel32
-                # QUOTA_LIMITS_HARDWS_MIN_DISABLE = 0x00000002
-                # QUOTA_LIMITS_HARDWS_MAX_DISABLE = 0x00000008
-                # -1, -1 = trim to minimum → OS reclaims pages immediately
-                kernel32.SetProcessWorkingSetSizeEx(
-                    kernel32.GetCurrentProcess(),
-                    ctypes.c_size_t(-1),   # dwMinimumWorkingSetSize
-                    ctypes.c_size_t(-1),   # dwMaximumWorkingSetSize
-                    0                      # Flags = 0
+                k32 = ctypes.windll.kernel32
+                k32.SetProcessWorkingSetSizeEx(
+                    k32.GetCurrentProcess(),
+                    ctypes.c_size_t(-1),
+                    ctypes.c_size_t(-1),
+                    0
                 )
             elif platform.system() == "Linux":
                 import ctypes
                 ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception as e:
+        except Exception:
             pass
 
         try:
