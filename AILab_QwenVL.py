@@ -1271,12 +1271,69 @@ class AILab_QwenVL_Advanced(QwenVLBase):
     def process(self, model_name, quantization, attention_mode, use_torch_compile, device, preset_prompt, custom_prompt, max_tokens, temperature, top_p, num_beams, repetition_penalty, frame_count, keep_model_loaded, clear_ram, seed, image=None, video=None):
         return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, clear_ram, attention_mode, use_torch_compile, device)
 
+class AILab_FreeMemory:
+    """
+    Utility node — place AFTER QwenVL in for-loop workflows.
+    Pass-through any value unchanged, but triggers aggressive GC + OS page trim.
+    Ensures large video tensors from previous iteration are freed before next Load Video runs.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "passthrough": ("STRING", {"forceInput": True}),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+                "video": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("passthrough",)
+    FUNCTION = "free"
+    CATEGORY = "🧪AILab/QwenVL"
+    OUTPUT_NODE = True
+
+    def free(self, passthrough, image=None, video=None):
+        # Drop local refs immediately so GC can collect upstream tensors
+        del image, video
+
+        # Aggressive GC — frees cyclic refs holding large tensors
+        for _ in range(4):
+            gc.collect()
+
+        # CUDA allocator flush
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+        # Return OS physical pages (Linux / Colab / WSL)
+        try:
+            if platform.system() == "Linux":
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
+        try:
+            vm = __import__("psutil").virtual_memory()
+            print(f"[FreeMemory] RAM after GC: {vm.percent:.1f}% used ({vm.available / 1024**3:.1f} GB free)")
+        except Exception:
+            pass
+
+        return (passthrough,)
+
+
 NODE_CLASS_MAPPINGS = {
     "AILab_QwenVL": AILab_QwenVL,
     "AILab_QwenVL_Advanced": AILab_QwenVL_Advanced,
+    "AILab_FreeMemory": AILab_FreeMemory,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AILab_QwenVL": "QwenVL A100",
     "AILab_QwenVL_Advanced": "QwenVL Advanced A100",
+    "AILab_FreeMemory": "Free Memory (GC) A100",
 }
