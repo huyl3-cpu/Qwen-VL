@@ -703,14 +703,54 @@ GLOBAL_QWENVL_STATE = {
 }
 
 
+# Module-level cache for the PromptExecutor instance (avoid gc scan every call)
+_PROMPT_EXECUTOR_REF = None
+
+def _find_prompt_executor():
+    """Find the live PromptExecutor instance.
+    Tries multiple paths in order of cost:
+      1. Cached ref from previous call
+      2. PromptServer.instance.prompt_executor (some ComfyUI forks)
+      3. gc.get_objects() scan (works for all versions)
+    """
+    global _PROMPT_EXECUTOR_REF
+    if _PROMPT_EXECUTOR_REF is not None and _PROMPT_EXECUTOR_REF() is not None:
+        return _PROMPT_EXECUTOR_REF()
+    # Try server attribute
+    try:
+        from server import PromptServer
+        e = getattr(PromptServer.instance, 'prompt_executor', None)
+        if e is not None and hasattr(e, 'caches'):
+            import weakref
+            _PROMPT_EXECUTOR_REF = weakref.ref(e)
+            return e
+    except Exception:
+        pass
+    # Fallback: scan all live objects for PromptExecutor
+    try:
+        import gc as _gc
+        import execution as _exec
+        for obj in _gc.get_objects():
+            if type(obj).__name__ == 'PromptExecutor' and hasattr(obj, 'caches'):
+                import weakref
+                _PROMPT_EXECUTOR_REF = weakref.ref(obj)
+                return obj
+    except Exception:
+        pass
+    return None
+
+
 def _deep_clear_output_cache():
     """Recursively clear output tensor data from ComfyUI's nested subcache tree.
     Frees video frame tensors accumulated by for-loop subgraph expansion.
     Does NOT touch subcaches structure to avoid executor assertion errors.
     """
+    executor = _find_prompt_executor()
+    if executor is None:
+        print("[QwenVL] Subcache clear skipped: could not find PromptExecutor")
+        return
     try:
-        from server import PromptServer
-        cache = PromptServer.instance.prompt_executor.caches.outputs
+        outputs_cache = executor.caches.outputs
         def _clear(c):
             cleared = 0
             if hasattr(c, 'cache') and isinstance(c.cache, dict):
@@ -720,11 +760,11 @@ def _deep_clear_output_cache():
                 for sc in c.subcaches.values():
                     cleared += _clear(sc)
             return cleared
-        n = _clear(cache)
+        n = _clear(outputs_cache)
         if n > 0:
             print(f"[QwenVL] Subcache deep-cleared {n} entries (video tensors freed)")
     except Exception as e:
-        print(f"[QwenVL] Subcache clear skipped: {e}")
+        print(f"[QwenVL] Subcache clear error: {e}")
 
 
 def clear_memory_cache():
@@ -1331,34 +1371,8 @@ class AILab_FreeMemory:
         # Drop local refs immediately
         del image, video
 
-        # ── CORE FIX: Deep-clear nested subcache output data ─────────────────
-        # Root cause: for-loop subgraph expansion builds a NESTED subcache tree:
-        #   Top → S1[video1 tensor] → S2[video2 tensor] → S3[video3] ...
-        # Each S_n.clean_unused() only cleans S_n, NEVER its parent S_{n-1}.
-        # After N iterations: S1...S_N all still holding their tensors → OOM.
-        #
-        # Fix: recursively clear cache.cache (tensor data) at every level.
-        # We do NOT touch cache.subcaches (structure) to avoid assertion errors
-        # when executor tries to store results in the next iteration.
-        try:
-            from server import PromptServer
-            executor = PromptServer.instance.prompt_executor
-            outputs_cache = executor.caches.outputs
-
-            def _deep_clear_data(cache):
-                cleared = 0
-                if hasattr(cache, 'cache') and isinstance(cache.cache, dict):
-                    cleared += len(cache.cache)
-                    cache.cache.clear()  # free tensor refs
-                if hasattr(cache, 'subcaches') and isinstance(cache.subcaches, dict):
-                    for sc in cache.subcaches.values():
-                        cleared += _deep_clear_data(sc)
-                return cleared
-
-            total = _deep_clear_data(outputs_cache)
-            print(f"[FreeMemory] Deep-cleared {total} output cache entries")
-        except Exception as e:
-            print(f"[FreeMemory] Cache clear error: {e}")
+        # Deep-clear nested subcache tree (shared with QwenVL clear_ram path)
+        _deep_clear_output_cache()
 
         # GC — frees cyclic refs after cache clear
         for _ in range(3):
