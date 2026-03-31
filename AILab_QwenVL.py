@@ -1299,35 +1299,7 @@ class AILab_FreeMemory:
         # Drop local refs immediately so GC can collect upstream tensors
         del image, video
 
-        # ── KEY FIX: Clear ComfyUI executor output cache ──────────────────────
-        # easy forLoopStart/End requeues each iteration as a NEW prompt_id.
-        # ComfyUI stores executor.outputs[prompt_id] for EVERY past iteration,
-        # accumulating ALL video tensors (e.g. 122 × 735MB = ~90GB).
-        # We clear old prompt outputs, keeping only the most recent one.
-        cleared_prompts = 0
-        try:
-            from server import PromptServer
-            executor = PromptServer.instance.prompt_executor
-            if hasattr(executor, "outputs") and isinstance(executor.outputs, dict):
-                # Keep last 3 prompt caches as buffer — forLoopEnd may reference
-                # the previous iteration's output for value accumulation.
-                # Clearing only older entries beyond this buffer is safe.
-                KEEP_LAST = 3
-                prompt_ids = list(executor.outputs.keys())
-                for old_id in prompt_ids[:-KEEP_LAST]:
-                    del executor.outputs[old_id]
-                    cleared_prompts += 1
-                if cleared_prompts > 0:
-                    print(f"[FreeMemory] Cleared {cleared_prompts} old prompt caches from executor")
-            # Also clear outputs_ui (UI preview data cache)
-            if hasattr(executor, "outputs_ui") and isinstance(executor.outputs_ui, dict):
-                ui_ids = list(executor.outputs_ui.keys())
-                for old_id in ui_ids[:-KEEP_LAST]:
-                    del executor.outputs_ui[old_id]
-        except Exception as e:
-            print(f"[FreeMemory] Could not clear executor cache: {e}")
-
-        # Aggressive GC — frees cyclic refs after executor cache clear
+        # Aggressive GC — frees cyclic refs first
         for _ in range(4):
             gc.collect()
 
@@ -1337,12 +1309,28 @@ class AILab_FreeMemory:
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
-        # Return OS physical pages (Linux / Colab / WSL)
+        # ── Return OS physical pages ─────────────────────────────────────────
+        # Root cause on Windows: Python frees tensor → C heap freed → but Windows
+        # keeps pages in process Working Set. psutil shows high RAM%.
+        # SetProcessWorkingSetSizeEx forces Windows to trim the working set.
         try:
-            if platform.system() == "Linux":
+            if platform.system() == "Windows":
+                import ctypes
+                import ctypes.wintypes
+                kernel32 = ctypes.windll.kernel32
+                # QUOTA_LIMITS_HARDWS_MIN_DISABLE = 0x00000002
+                # QUOTA_LIMITS_HARDWS_MAX_DISABLE = 0x00000008
+                # -1, -1 = trim to minimum → OS reclaims pages immediately
+                kernel32.SetProcessWorkingSetSizeEx(
+                    kernel32.GetCurrentProcess(),
+                    ctypes.c_size_t(-1),   # dwMinimumWorkingSetSize
+                    ctypes.c_size_t(-1),   # dwMaximumWorkingSetSize
+                    0                      # Flags = 0
+                )
+            elif platform.system() == "Linux":
                 import ctypes
                 ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
+        except Exception as e:
             pass
 
         try:
