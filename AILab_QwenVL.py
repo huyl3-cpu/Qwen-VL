@@ -742,9 +742,17 @@ def _find_prompt_executor():
 
 def _deep_clear_output_cache():
     """Scan ComfyUI output cache tree and free video frame tensors (IMAGE output).
-    Only deletes entries containing a 4D float32 tensor (N,H,W,3) from VHS_LoadVideo nodes.
-    Does NOT clear subcaches{} dict itself — that would cause AssertionError during for-loop.
-    Safe to call mid-execution.
+
+    CacheEntry structure (from execution.py):
+        CacheEntry.outputs = list of output slots
+        Each slot = list of values: outputs[slot_index][batch_index]
+        For VHS_LoadVideo: outputs[0][0] = Tensor[N, H, W, 3]  (IMAGE)
+                           outputs[1][0] = int (frame_count)
+                           outputs[2][0] = audio
+                           outputs[3][0] = video_info dict
+
+    Only deletes cache entries whose first slot contains a 4D float32 tensor.
+    Does NOT clear subcaches{} dict — that would cause AssertionError during for-loop.
     """
     executor = _find_prompt_executor()
     if executor is None:
@@ -754,36 +762,59 @@ def _deep_clear_output_cache():
         outputs_cache = executor.caches.outputs
 
         def _has_image_tensor(cache_entry):
-            """Return True if cache_entry contains a 4D float32 tensor (IMAGE output)."""
+            """CacheEntry.outputs[slot_idx] = [value, value, ...]
+            Check if any slot contains a 4D float32 tensor (IMAGE output from VHS_LoadVideo).
+            """
             try:
                 outputs = getattr(cache_entry, 'outputs', None)
-                if outputs is None:
+                if not outputs:
                     return False
-                for item in outputs:
-                    if isinstance(item, torch.Tensor) and item.ndim == 4 and item.dtype == torch.float32:
-                        return True
+                # Each slot is a list; iterate all slots and all values in each slot
+                for slot in outputs:
+                    if not isinstance(slot, (list, tuple)):
+                        # Direct tensor (older ComfyUI versions)
+                        if isinstance(slot, torch.Tensor) and slot.ndim == 4 and slot.dtype == torch.float32:
+                            return True
+                        continue
+                    for val in slot:
+                        if isinstance(val, torch.Tensor) and val.ndim == 4 and val.dtype == torch.float32:
+                            return True
             except Exception:
                 pass
             return False
 
         def _scan_and_clear(c):
             freed = 0
+            freed_mb = 0.0
             if hasattr(c, 'cache') and isinstance(c.cache, dict):
                 keys_to_del = [k for k, v in c.cache.items() if _has_image_tensor(v)]
                 for k in keys_to_del:
+                    # Estimate size before deleting for logging
+                    try:
+                        entry = c.cache[k]
+                        for slot in (entry.outputs or []):
+                            vals = slot if isinstance(slot, (list, tuple)) else [slot]
+                            for val in vals:
+                                if isinstance(val, torch.Tensor):
+                                    freed_mb += val.numel() * val.element_size() / 1024 / 1024
+                    except Exception:
+                        pass
                     del c.cache[k]
                     freed += 1
             if hasattr(c, 'subcaches') and isinstance(c.subcaches, dict):
                 for sc in c.subcaches.values():
-                    freed += _scan_and_clear(sc)
+                    sub_freed, sub_mb = _scan_and_clear(sc)
+                    freed += sub_freed
+                    freed_mb += sub_mb
                 # ⚠️ Do NOT call c.subcaches.clear() — breaks for-loop execution
-            return freed
+            return freed, freed_mb
 
-        n = _scan_and_clear(outputs_cache)
+        n, mb = _scan_and_clear(outputs_cache)
         if n > 0:
-            print(f"[QwenVL] Subcache deep-cleared {n} entries (video tensors freed)")
+            print(f"[QwenVL] Subcache cleared {n} video cache entries (~{mb:.1f} MB tensors freed)")
     except Exception as e:
         print(f"[QwenVL] Subcache clear error: {e}")
+
 
 
 def clear_memory_cache():
@@ -1146,6 +1177,12 @@ class QwenVLBase:
             if frames:
                 conversation[0]["content"].append({"type": "video", "video": frames})
         conversation[0]["content"].append({"type": "text", "text": prompt_text})
+
+        # ✅ Release original IMAGE tensors (from VHS_LoadVideo) immediately after PIL conversion
+        # These large [N,H,W,3] tensors are no longer needed once PIL frames are created.
+        del image, video
+        image = video = None
+
         chat = self.processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
         images = [item["image"] for item in conversation[0]["content"] if item["type"] == "image"]
         video_frames = [frame for item in conversation[0]["content"] if item["type"] == "video" for frame in item["video"]]
