@@ -759,6 +759,7 @@ def _deep_clear_output_cache():
             if hasattr(c, 'subcaches') and isinstance(c.subcaches, dict):
                 for sc in c.subcaches.values():
                     cleared += _clear(sc)
+                c.subcaches.clear()
             return cleared
         n = _clear(outputs_cache)
         if n > 0:
