@@ -743,7 +743,13 @@ def _find_prompt_executor():
 def _deep_clear_output_cache():
     """Recursively clear output tensor data from ComfyUI's nested subcache tree.
     Frees video frame tensors accumulated by for-loop subgraph expansion.
-    Does NOT touch subcaches structure to avoid executor assertion errors.
+
+    IMPORTANT: Does NOT clear subcaches{} dict itself — ComfyUI's HierarchicalCache
+    needs the subcache structure to remain intact during for-loop execution.
+    Clearing subcaches would cause: assert cache is not None (AssertionError)
+    in caching.py because _get_cache_for() would return None for loop nodes.
+
+    Only clears cache{} data (tensor values) inside each subcache, which is safe.
     """
     executor = _find_prompt_executor()
     if executor is None:
@@ -759,7 +765,8 @@ def _deep_clear_output_cache():
             if hasattr(c, 'subcaches') and isinstance(c.subcaches, dict):
                 for sc in c.subcaches.values():
                     cleared += _clear(sc)
-                c.subcaches.clear()
+                # ⚠️ Do NOT call c.subcaches.clear() here!
+                # ComfyUI still needs subcache structure during for-loop execution.
             return cleared
         n = _clear(outputs_cache)
         if n > 0:
