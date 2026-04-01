@@ -741,15 +741,10 @@ def _find_prompt_executor():
 
 
 def _deep_clear_output_cache():
-    """Recursively clear output tensor data from ComfyUI's nested subcache tree.
-    Frees video frame tensors accumulated by for-loop subgraph expansion.
-
-    IMPORTANT: Does NOT clear subcaches{} dict itself — ComfyUI's HierarchicalCache
-    needs the subcache structure to remain intact during for-loop execution.
-    Clearing subcaches would cause: assert cache is not None (AssertionError)
-    in caching.py because _get_cache_for() would return None for loop nodes.
-
-    Only clears cache{} data (tensor values) inside each subcache, which is safe.
+    """Scan ComfyUI output cache tree and free video frame tensors (IMAGE output).
+    Only deletes entries containing a 4D float32 tensor (N,H,W,3) from VHS_LoadVideo nodes.
+    Does NOT clear subcaches{} dict itself — that would cause AssertionError during for-loop.
+    Safe to call mid-execution.
     """
     executor = _find_prompt_executor()
     if executor is None:
@@ -757,18 +752,34 @@ def _deep_clear_output_cache():
         return
     try:
         outputs_cache = executor.caches.outputs
-        def _clear(c):
-            cleared = 0
+
+        def _has_image_tensor(cache_entry):
+            """Return True if cache_entry contains a 4D float32 tensor (IMAGE output)."""
+            try:
+                outputs = getattr(cache_entry, 'outputs', None)
+                if outputs is None:
+                    return False
+                for item in outputs:
+                    if isinstance(item, torch.Tensor) and item.ndim == 4 and item.dtype == torch.float32:
+                        return True
+            except Exception:
+                pass
+            return False
+
+        def _scan_and_clear(c):
+            freed = 0
             if hasattr(c, 'cache') and isinstance(c.cache, dict):
-                cleared += len(c.cache)
-                c.cache.clear()
+                keys_to_del = [k for k, v in c.cache.items() if _has_image_tensor(v)]
+                for k in keys_to_del:
+                    del c.cache[k]
+                    freed += 1
             if hasattr(c, 'subcaches') and isinstance(c.subcaches, dict):
                 for sc in c.subcaches.values():
-                    cleared += _clear(sc)
-                # ⚠️ Do NOT call c.subcaches.clear() here!
-                # ComfyUI still needs subcache structure during for-loop execution.
-            return cleared
-        n = _clear(outputs_cache)
+                    freed += _scan_and_clear(sc)
+                # ⚠️ Do NOT call c.subcaches.clear() — breaks for-loop execution
+            return freed
+
+        n = _scan_and_clear(outputs_cache)
         if n > 0:
             print(f"[QwenVL] Subcache deep-cleared {n} entries (video tensors freed)")
     except Exception as e:
