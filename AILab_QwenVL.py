@@ -1217,8 +1217,8 @@ class QwenVLBase:
             kwargs.update({"do_sample": True, "temperature": temperature, "top_p": top_p})
         else:
             kwargs["do_sample"] = False
-        # Disable KV cache during generation to prevent RAM accumulation across runs
-        kwargs["use_cache"] = False
+        # use_cache=True (default) — KV cache is per-generation only and freed
+        # in the finally block below. Disabling it causes 5-10x slower inference.
         outputs = None
         try:
             outputs = self.model.generate(**model_inputs, **kwargs)
