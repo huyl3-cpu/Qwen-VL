@@ -1295,17 +1295,31 @@ class QwenVLBase:
 
             return (text,)
         finally:
-            # Release ComfyUI input tensor refs held by this invocation
+            # ── Step 1: Drop local refs to image/video tensors ──────────────────
             del image, video
 
+            # ── Step 2: Always clear VHS_LoadVideo tensor from ComfyUI cache ────
+            # Each for-loop iteration loads a DIFFERENT video → new cache entry.
+            # Without explicitly clearing, old entries accumulate → RAM overflow.
+            # keep_model_loaded=True is fine here — only tensor cache is cleared,
+            # NOT the model weights.
+            _deep_clear_output_cache()
+
+            # ── Step 3: Always run GC + CUDA empty cache ─────────────────────────
+            # Needed to actually reclaim pages after tensor refs drop to 0.
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # ── Step 4: Optionally unload model (clear_ram or not keep_model) ───
             if clear_ram:
-                print("[QwenVL] clear_ram=True — unloading model + clearing all caches…")
+                print("[QwenVL] clear_ram=True — unloading model…")
                 self.clear()          # unload model from VRAM + RAM
-                clear_memory_cache()  # deep-clear subcache + CUDA + GC
-            else:
-                gc.collect()  # light GC only
-            if not keep_model_loaded and not clear_ram:
+                clear_memory_cache()  # HF KV cache + deep GC + OS pages
+            elif not keep_model_loaded:
                 self.clear()          # unload if keep_model_loaded=False
+
+
 
             # Memory delta log — helps diagnose where growth occurs
             try:
